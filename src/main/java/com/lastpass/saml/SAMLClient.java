@@ -63,6 +63,7 @@ import java.io.StringReader;
 import java.io.ByteArrayOutputStream;
 import java.io.UnsupportedEncodingException;
 import java.io.IOException;
+import java.security.cert.Certificate;
 
 import java.util.HashMap;
 import java.util.ArrayList;
@@ -72,53 +73,44 @@ import java.util.zip.Deflater;
 
 import javax.xml.bind.DatatypeConverter;
 
-
 /**
- * A SAMLClient acts as on behalf of a SAML Service
- * Provider to generate requests and process responses.
+ * A SAMLClient acts as on behalf of a SAML Service Provider to generate requests and process responses.
  *
- * To integrate a service, one must generally do the
- * following:
+ * To integrate a service, one must generally do the following:
  *
- *  1. Change the login process to call
- *     generateAuthnRequest() to get a request and link,
- *     and then GET/POST that to the IdP login URL.
+ * 1. Change the login process to call generateAuthnRequest() to get a request and link, and then GET/POST that to the
+ * IdP login URL.
  *
- *  2. Create a new URL that acts as the
- *     AssertionConsumerService -- it will call
- *     validateResponse on the response body to
- *     verify the assertion; on success it will
- *     use the subject as the authenticated user for
- *     the web application.
+ * 2. Create a new URL that acts as the AssertionConsumerService -- it will call validateResponse on the response body
+ * to verify the assertion; on success it will use the subject as the authenticated user for the web application.
  *
- * The specific changes needed to the application are
- * outside the scope of this SDK.
+ * The specific changes needed to the application are outside the scope of this SDK.
  */
-public class SAMLClient
-{
+public class SAMLClient {
+
     private SPConfig spConfig;
     private IdPConfig idpConfig;
-    private SignatureValidator sigValidator;
+    private List<SignatureValidator> sigValidators = new ArrayList<SignatureValidator>();
     private BasicParserPool parsers;
 
     /* do date comparisons +/- this many seconds */
     private static final int slack = (int) TimeUnit.MINUTES.toSeconds(5);
 
     /**
-     * Create a new SAMLClient, using the IdPConfig for
-     * endpoints and validation.
+     * Create a new SAMLClient, using the IdPConfig for endpoints and validation.
      */
     public SAMLClient(SPConfig spConfig, IdPConfig idpConfig)
-        throws SAMLException
-    {
+            throws SAMLException {
         this.spConfig = spConfig;
         this.idpConfig = idpConfig;
 
-        BasicCredential cred = new BasicCredential();
-        cred.setEntityId(idpConfig.getEntityId());
-        cred.setPublicKey(idpConfig.getCert().getPublicKey());
-
-        sigValidator = new SignatureValidator(cred);
+        for (Certificate signingCert : idpConfig.getCerts()) {
+            BasicCredential cred = new BasicCredential();
+            cred.setEntityId(idpConfig.getEntityId());
+            cred.setPublicKey(signingCert.getPublicKey());
+            SignatureValidator sigValidator = new SignatureValidator(cred);
+            sigValidators.add(sigValidator);
+        }
 
         // create xml parsers
         parsers = new BasicParserPool();
@@ -130,8 +122,7 @@ public class SAMLClient
      *
      * @return the IdPConfig associated with this client
      */
-    public IdPConfig getIdPConfig()
-    {
+    public IdPConfig getIdPConfig() {
         return idpConfig;
     }
 
@@ -140,33 +131,27 @@ public class SAMLClient
      *
      * @return the SPConfig associated with this client
      */
-    public SPConfig getSPConfig()
-    {
+    public SPConfig getSPConfig() {
         return spConfig;
     }
 
     private Response parseResponse(String authnResponse)
-        throws SAMLException
-    {
+            throws SAMLException {
         try {
             Document doc = parsers.getBuilder()
-                .parse(new InputSource(new StringReader(authnResponse)));
+                    .parse(new InputSource(new StringReader(authnResponse)));
 
             Element root = doc.getDocumentElement();
             return (Response) Configuration.getUnmarshallerFactory()
-                .getUnmarshaller(root)
-                .unmarshall(root);
-        }
-        catch (org.opensaml.xml.parse.XMLParserException e) {
+                    .getUnmarshaller(root)
+                    .unmarshall(root);
+        } catch (org.opensaml.xml.parse.XMLParserException e) {
             throw new SAMLException(e);
-        }
-        catch (org.opensaml.xml.io.UnmarshallingException e) {
+        } catch (org.opensaml.xml.io.UnmarshallingException e) {
             throw new SAMLException(e);
-        }
-        catch (org.xml.sax.SAXException e) {
+        } catch (org.xml.sax.SAXException e) {
             throw new SAMLException(e);
-        }
-        catch (java.io.IOException e) {
+        } catch (java.io.IOException e) {
             throw new SAMLException(e);
         }
     }
@@ -175,28 +160,26 @@ public class SAMLClient
      * Decrypt an assertion using the privkey stored in SPConfig.
      */
     private Assertion decrypt(EncryptedAssertion encrypted)
-        throws DecryptionException
-    {
-        if (spConfig.getPrivateKey() == null)
+            throws DecryptionException {
+        if (spConfig.getPrivateKey() == null) {
             throw new DecryptionException("Encrypted assertion found but no SP key available");
+        }
         BasicCredential cred = new BasicCredential();
         cred.setPrivateKey(spConfig.getPrivateKey());
-        StaticKeyInfoCredentialResolver resolver =
-            new StaticKeyInfoCredentialResolver(cred);
-        Decrypter decrypter =
-            new Decrypter(null, resolver, new InlineEncryptedKeyResolver());
+        StaticKeyInfoCredentialResolver resolver
+                = new StaticKeyInfoCredentialResolver(cred);
+        Decrypter decrypter
+                = new Decrypter(null, resolver, new InlineEncryptedKeyResolver());
         decrypter.setRootInNewDocument(true);
 
         return decrypter.decrypt(encrypted);
     }
 
     /**
-     * Retrieve all supplied assertions, decrypting any encrypted
-     * assertions if necessary.
+     * Retrieve all supplied assertions, decrypting any encrypted assertions if necessary.
      */
     private List<Assertion> getAssertions(Response response)
-        throws DecryptionException
-    {
+            throws DecryptionException {
         List<Assertion> assertions = new ArrayList<Assertion>();
         assertions.addAll(response.getAssertions());
 
@@ -208,26 +191,40 @@ public class SAMLClient
     }
 
     private void validate(Response response)
-        throws ValidationException
-    {
+            throws ValidationException {
         // response signature must match IdP's key, if present
         Signature sig = response.getSignature();
-        if (sig != null)
-            sigValidator.validate(sig);
+        ValidationException validationEx = null;
+        if (sig != null) {
+            for (SignatureValidator sigValidator : sigValidators) {
+                try {
+                    sigValidator.validate(sig);
+                    validationEx = null;
+                    break;
+                } catch (ValidationException e) {
+                    //System.out.println("1-fail");
+                    validationEx = e;
+                }
+            }
+            if (validationEx != null) {
+                throw validationEx;
+            }
+        }
 
         // response must be successful
-        if (response.getStatus() == null ||
-            response.getStatus().getStatusCode() == null ||
-            !(StatusCode.SUCCESS_URI
-                .equals(response.getStatus().getStatusCode().getValue()))) {
+        if (response.getStatus() == null
+                || response.getStatus().getStatusCode() == null
+                || !(StatusCode.SUCCESS_URI
+                        .equals(response.getStatus().getStatusCode().getValue()))) {
             throw new ValidationException(
-                "Response has an unsuccessful status code");
+                    "Response has an unsuccessful status code");
         }
 
         // response destination must match ACS
-        if (!spConfig.getAcs().equals(response.getDestination()))
+        if (!spConfig.getAcs().equals(response.getDestination())) {
             throw new ValidationException(
-                "Response is destined for a different endpoint");
+                    "Response is destined for a different endpoint");
+        }
 
         DateTime now = DateTime.now();
 
@@ -235,13 +232,15 @@ public class SAMLClient
         DateTime issueInstant = response.getIssueInstant();
 
         if (issueInstant != null) {
-            if (issueInstant.isBefore(now.minusSeconds(slack)))
+            if (issueInstant.isBefore(now.minusSeconds(slack))) {
                 throw new ValidationException(
-                    "Response IssueInstant is in the past");
+                        "Response IssueInstant is in the past");
+            }
 
-            if (issueInstant.isAfter(now.plusSeconds(slack)))
+            if (issueInstant.isAfter(now.plusSeconds(slack))) {
                 throw new ValidationException(
-                    "Response IssueInstant is in the future");
+                        "Response IssueInstant is in the future");
+            }
         }
 
         List<Assertion> assertions = null;
@@ -251,48 +250,66 @@ public class SAMLClient
             throw new ValidationException(e);
         }
 
-        for (Assertion assertion: assertions) {
+        for (Assertion assertion : assertions) {
 
             // Assertion must be signed correctly
-            if (!assertion.isSigned())
+            if (!assertion.isSigned()) {
                 throw new ValidationException(
-                    "Assertion must be signed");
+                        "Assertion must be signed");
+            }
 
             sig = assertion.getSignature();
-            sigValidator.validate(sig);
+            if (sig != null) {
+                for (SignatureValidator sigValidator : sigValidators) {
+                    try {
+                        sigValidator.validate(sig);
+                        validationEx = null;
+                        break;
+                    } catch (ValidationException e) {
+                        //System.out.println("1-fail");
+                        validationEx = e;
+                    }
+                }
+                if (validationEx != null) {
+                    throw validationEx;
+                }
+            }
 
             // Assertion must contain an authnstatement
             // with an unexpired session
             if (assertion.getAuthnStatements().isEmpty()) {
                 throw new ValidationException(
-                    "Assertion should contain an AuthnStatement");
+                        "Assertion should contain an AuthnStatement");
             }
-            for (AuthnStatement as: assertion.getAuthnStatements()) {
+            for (AuthnStatement as : assertion.getAuthnStatements()) {
                 DateTime sessionTime = as.getSessionNotOnOrAfter();
                 if (sessionTime != null) {
                     DateTime exp = sessionTime.plusSeconds(slack);
-                    if (exp != null &&
-                            (now.isEqual(exp) || now.isAfter(exp)))
+                    if (exp != null
+                            && (now.isEqual(exp) || now.isAfter(exp))) {
                         throw new ValidationException(
                                 "AuthnStatement has expired");
+                    }
                 }
             }
 
             if (assertion.getConditions() == null) {
                 throw new ValidationException(
-                    "Assertion should contain conditions");
+                        "Assertion should contain conditions");
             }
 
             // Assertion IssueInstant must be within a day
             DateTime instant = assertion.getIssueInstant();
             if (instant != null) {
-                if (instant.isBefore(now.minusSeconds(slack)))
+                if (instant.isBefore(now.minusSeconds(slack))) {
                     throw new ValidationException(
-                        "Response IssueInstant is in the past");
+                            "Response IssueInstant is in the past");
+                }
 
-                if (instant.isAfter(now.plusSeconds(slack)))
+                if (instant.isAfter(now.plusSeconds(slack))) {
                     throw new ValidationException(
-                        "Response IssueInstant is in the future");
+                            "Response IssueInstant is in the future");
+                }
             }
 
             // Conditions must be met by current time
@@ -300,89 +317,98 @@ public class SAMLClient
             DateTime notBefore = conditions.getNotBefore();
             DateTime notOnOrAfter = conditions.getNotOnOrAfter();
 
-            if (notBefore == null || notOnOrAfter == null)
+            if (notBefore == null || notOnOrAfter == null) {
                 throw new ValidationException(
-                    "Assertion conditions must have limits");
+                        "Assertion conditions must have limits");
+            }
 
             notBefore = notBefore.minusSeconds(slack);
             notOnOrAfter = notOnOrAfter.plusSeconds(slack);
 
-            if (now.isBefore(notBefore))
+            if (now.isBefore(notBefore)) {
                 throw new ValidationException(
-                    "Assertion conditions is in the future");
+                        "Assertion conditions is in the future");
+            }
 
-            if (now.isEqual(notOnOrAfter) || now.isAfter(notOnOrAfter))
+            if (now.isEqual(notOnOrAfter) || now.isAfter(notOnOrAfter)) {
                 throw new ValidationException(
-                    "Assertion conditions is in the past");
+                        "Assertion conditions is in the past");
+            }
 
             // If subjectConfirmationData is included, it must
             // have a recipient that matches ACS, with a valid
             // NotOnOrAfter
             Subject subject = assertion.getSubject();
-            if (subject != null &&
-                !subject.getSubjectConfirmations().isEmpty()) {
+            if (subject != null
+                    && !subject.getSubjectConfirmations().isEmpty()) {
                 boolean foundRecipient = false;
-                for (SubjectConfirmation sc: subject.getSubjectConfirmations()) {
-                    if (sc.getSubjectConfirmationData() == null)
+                for (SubjectConfirmation sc : subject.getSubjectConfirmations()) {
+                    if (sc.getSubjectConfirmationData() == null) {
                         continue;
+                    }
 
                     SubjectConfirmationData scd = sc.getSubjectConfirmationData();
                     if (scd.getNotOnOrAfter() != null) {
                         DateTime chkdate = scd.getNotOnOrAfter().plusSeconds(slack);
                         if (now.isEqual(chkdate) || now.isAfter(chkdate)) {
                             throw new ValidationException(
-                                "SubjectConfirmationData is in the past");
+                                    "SubjectConfirmationData is in the past");
                         }
                     }
 
-                    if (spConfig.getAcs().equals(scd.getRecipient()))
+                    if (spConfig.getAcs().equals(scd.getRecipient())) {
                         foundRecipient = true;
+                    }
                 }
 
-                if (!foundRecipient)
+                if (!foundRecipient) {
                     throw new ValidationException(
-                        "No SubjectConfirmationData found for ACS");
+                            "No SubjectConfirmationData found for ACS");
+                }
             }
 
             // audience must include intended SP issuer
-            if (conditions.getAudienceRestrictions().isEmpty())
+            if (conditions.getAudienceRestrictions().isEmpty()) {
                 throw new ValidationException(
-                    "Assertion conditions must have audience restrictions");
+                        "Assertion conditions must have audience restrictions");
+            }
 
             // only one audience restriction supported: we can only
             // check against the single SP.
-            if (conditions.getAudienceRestrictions().size() > 1)
+            if (conditions.getAudienceRestrictions().size() > 1) {
                 throw new ValidationException(
-                    "Assertion contains multiple audience restrictions");
+                        "Assertion contains multiple audience restrictions");
+            }
 
             AudienceRestriction ar = conditions.getAudienceRestrictions()
-                .get(0);
+                    .get(0);
 
             // at least one of the audiences must match our SP
             boolean foundSP = false;
-            for (Audience a: ar.getAudiences()) {
-                if (spConfig.getEntityId().equals(a.getAudienceURI()))
+            for (Audience a : ar.getAudiences()) {
+                if (spConfig.getEntityId().equals(a.getAudienceURI())) {
                     foundSP = true;
+                }
             }
-            if (!foundSP)
+            if (!foundSP) {
                 throw new ValidationException(
-                    "Assertion audience does not include issuer");
+                        "Assertion audience does not include issuer");
+            }
         }
     }
 
     @SuppressWarnings("unchecked")
     private String createAuthnRequest(String requestId)
-        throws SAMLException
-    {
+            throws SAMLException {
         XMLObjectBuilderFactory builderFactory = Configuration.getBuilderFactory();
 
-        SAMLObjectBuilder<AuthnRequest> builder =
-            (SAMLObjectBuilder<AuthnRequest>) builderFactory
-            .getBuilder(AuthnRequest.DEFAULT_ELEMENT_NAME);
+        SAMLObjectBuilder<AuthnRequest> builder
+                = (SAMLObjectBuilder<AuthnRequest>) builderFactory
+                        .getBuilder(AuthnRequest.DEFAULT_ELEMENT_NAME);
 
-        SAMLObjectBuilder<Issuer> issuerBuilder =
-            (SAMLObjectBuilder<Issuer>) builderFactory
-            .getBuilder(Issuer.DEFAULT_ELEMENT_NAME);
+        SAMLObjectBuilder<Issuer> issuerBuilder
+                = (SAMLObjectBuilder<Issuer>) builderFactory
+                        .getBuilder(Issuer.DEFAULT_ELEMENT_NAME);
 
         AuthnRequest request = builder.buildObject();
         request.setAssertionConsumerServiceURL(spConfig.getAcs().toString());
@@ -397,25 +423,23 @@ public class SAMLClient
         try {
             // samlobject to xml dom object
             Element elem = Configuration.getMarshallerFactory()
-                .getMarshaller(request)
-                .marshall(request);
+                    .getMarshaller(request)
+                    .marshall(request);
 
             // and to a string...
             Document document = elem.getOwnerDocument();
             DOMImplementationLS domImplLS = (DOMImplementationLS) document
-                .getImplementation();
+                    .getImplementation();
             LSSerializer serializer = domImplLS.createLSSerializer();
             serializer.getDomConfig().setParameter("xml-declaration", false);
             return serializer.writeToString(elem);
-        }
-        catch (MarshallingException e) {
+        } catch (MarshallingException e) {
             throw new SAMLException(e);
         }
     }
 
     private byte[] deflate(byte[] input)
-        throws IOException
-    {
+            throws IOException {
         // deflate and base-64 encode it
         Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
         deflater.setInput(input);
@@ -436,16 +460,13 @@ public class SAMLClient
     }
 
     /**
-     * Create a new AuthnRequest suitable for sending to an HTTPRedirect
-     * binding endpoint on the IdP.  The SPConfig will be used to fill
-     * in the ACS and issuer, and the IdP will be used to set the
-     * destination.
+     * Create a new AuthnRequest suitable for sending to an HTTPRedirect binding endpoint on the IdP. The SPConfig will
+     * be used to fill in the ACS and issuer, and the IdP will be used to set the destination.
      *
      * @return a deflated, base64-encoded AuthnRequest
      */
     public String generateAuthnRequest(String requestId)
-        throws SAMLException
-    {
+            throws SAMLException {
         String request = createAuthnRequest(requestId);
 
         try {
@@ -453,24 +474,22 @@ public class SAMLClient
             return DatatypeConverter.printBase64Binary(compressed);
         } catch (UnsupportedEncodingException e) {
             throw new SAMLException(
-                "Apparently your platform lacks UTF-8.  That's too bad.", e);
+                    "Apparently your platform lacks UTF-8.  That's too bad.", e);
         } catch (IOException e) {
             throw new SAMLException("Unable to compress the AuthnRequest", e);
         }
     }
 
     /**
-     * Check an authnResponse and return the subject if validation
-     * succeeds.  The NameID from the subject in the first valid
-     * assertion is returned along with the attributes.
+     * Check an authnResponse and return the subject if validation succeeds. The NameID from the subject in the first
+     * valid assertion is returned along with the attributes.
      *
      * @param authnResponse a base64-encoded AuthnResponse from the SP
      * @throws SAMLException if validation failed.
      * @return the authenticated subject/attributes as an AttributeSet
      */
     public AttributeSet validateResponse(String authnResponse)
-        throws SAMLException
-    {
+            throws SAMLException {
         byte[] decoded = DatatypeConverter.parseBase64Binary(authnResponse);
         try {
             authnResponse = new String(decoded, "UTF-8");
@@ -496,14 +515,14 @@ public class SAMLClient
         // we only look at first assertion
         if (assertions.size() != 1) {
             throw new SAMLException(
-                "Response should have a single assertion.");
+                    "Response should have a single assertion.");
         }
         Assertion assertion = assertions.get(0);
 
         Subject subject = assertion.getSubject();
         if (subject == null) {
             throw new SAMLException(
-                "No subject contained in the assertion.");
+                    "No subject contained in the assertion.");
         }
         if (subject.getNameID() == null) {
             throw new SAMLException("No NameID found in the subject.");
@@ -511,11 +530,11 @@ public class SAMLClient
 
         String nameId = subject.getNameID().getValue();
 
-        HashMap<String, List<String>> attributes =
-            new HashMap<String, List<String>>();
+        HashMap<String, List<String>> attributes
+                = new HashMap<String, List<String>>();
 
         for (AttributeStatement atbs : assertion.getAttributeStatements()) {
-            for (Attribute atb: atbs.getAttributes()) {
+            for (Attribute atb : atbs.getAttributes()) {
                 String name = atb.getName();
                 List<String> values = new ArrayList<String>();
                 for (XMLObject obj : atb.getAttributeValues()) {
